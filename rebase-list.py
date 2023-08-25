@@ -2,6 +2,7 @@ import argparse
 import re
 import subprocess
 from multiprocessing.pool import ThreadPool
+from typing import Optional
 
 
 def parse_args():
@@ -24,14 +25,16 @@ def get_commit_symmetric_difference(not_in: str, has_in: str) -> list[str]:
 
 
 class CommitInfo:
-    def __init__(self, author: str, date: str, message_first_line: str, patch_hash: str):
+    def __init__(self, author: str, date: str, message_first_line: str, patch_hash: str, reverts_commit: str):
         self.author = author
         self.date = date
         self.message_first_line = message_first_line
         self.patch_hash = patch_hash
+        self.reverts_commit = reverts_commit
 
 
 AUTHOR_EMAIL_REGEX = re.compile(b"^.*<(.+@.+)>$")
+REVERTS_REGEX = re.compile(b"[Rr]everts (?:commit )?(\\w+)")
 
 
 def get_commit_patch_id(commit: str) -> tuple[str, CommitInfo]:
@@ -53,6 +56,12 @@ def get_commit_patch_id(commit: str) -> tuple[str, CommitInfo]:
     date = lines[2].strip().strip(b'Date: ').strip(b' +0000').decode(errors='replace').replace('\uFFFD', '?')
     message_first_line = lines[3].decode(errors='replace').replace('\uFFFD', '?')
 
+    reverts_commit = ""
+    for line in lines:
+        reverts_commit_result = REVERTS_REGEX.search(line)
+        if reverts_commit_result:
+            reverts_commit = reverts_commit_result.group(1).decode()
+
     result = subprocess.run(
         ["git", "patch-id"],
         stdout=subprocess.PIPE,
@@ -64,7 +73,7 @@ def get_commit_patch_id(commit: str) -> tuple[str, CommitInfo]:
     raw_out = result.stdout.decode()
     if raw_out:
         patch_id = raw_out.split()[0]
-    return commit, CommitInfo(author, date, message_first_line, patch_id)
+    return commit, CommitInfo(author, date, message_first_line, patch_id, reverts_commit)
 
 
 def build_patch_id_map(commits: list[str]) -> dict[str, CommitInfo]:
@@ -80,13 +89,44 @@ def build_patch_id_map(commits: list[str]) -> dict[str, CommitInfo]:
     return result
 
 
-def inverse_map(m: dict[str, CommitInfo]) -> dict[str, list[str]]:
+def inverse_map(commits: dict[str, CommitInfo]) -> dict[str, list[str]]:
     result = {}
-    for commit, info in m.items():
+    for commit, info in commits.items():
         if info.patch_hash:
             result.setdefault(info.patch_hash, []).append(commit)
 
     return result
+
+
+def search_full_commit_hash(commit_hash: str, commits: dict[str, CommitInfo]) -> Optional[str]:
+    if commit_hash in commits:
+        return commit_hash
+
+    if commit_hash not in commits:
+        for full_commit_hash in commits.keys():
+            if full_commit_hash.startswith(commit_hash):
+                return full_commit_hash
+    return None
+
+
+def build_reverts(from_branch: dict[str, CommitInfo], from_upstream: dict[str, CommitInfo]) \
+        -> tuple[dict[str, str], set[str]]:
+    reverted_from_branch = {}
+    reverts_from_upstream = set()
+    for commit, info in from_branch.items():
+        if info.reverts_commit:
+            reverts_commit_full_hash = search_full_commit_hash(info.reverts_commit, from_branch)
+            if reverts_commit_full_hash:
+                reverted_from_branch[reverts_commit_full_hash] = commit
+            else:
+                reverts_commit_full_hash = search_full_commit_hash(info.reverts_commit, from_upstream)
+                if reverts_commit_full_hash:
+                    reverts_from_upstream.add(commit)
+
+            if reverts_commit_full_hash:
+                info.reverts_commit = reverts_commit_full_hash
+
+    return reverted_from_branch, reverts_from_upstream
 
 
 def main():
@@ -111,6 +151,8 @@ def main():
     upstream_patch_id_map = build_patch_id_map(has_in_upstream_not_in_branch)
     upstream_patch_id_inv_map = inverse_map(upstream_patch_id_map)
 
+    reverted_from_branch, reverts_from_upstream = build_reverts(branch_patch_id_map, upstream_patch_id_map)
+
     empty_commits = 0
     has_in_brunch_but_found_in_upstream = {}
     for commit, commit_info in branch_patch_id_map.items():
@@ -122,6 +164,8 @@ def main():
     print(f"total to apply: {len(has_in_branch_not_in_upstream)}")
     print(f"empty commits: {empty_commits}")
     print(f"found in upstream: {len(has_in_brunch_but_found_in_upstream)}")
+    print(f"reverted from branch: {len(reverted_from_branch)}")
+    print(f"reverts from upstream: {len(reverts_from_upstream)}")
     effective = len(has_in_branch_not_in_upstream) - len(has_in_brunch_but_found_in_upstream) - empty_commits
     print(f"total to apply without found and empty: {effective}")
     print("--------------------------------------------------\n")
@@ -134,6 +178,16 @@ def main():
             extra_msgs.append("empty commit")
         if commit in duplicates:
             extra_msgs.append(f"duplicate of [{', '.join(duplicates[commit])}]")
+        if commit in reverted_from_branch:
+            extra_msgs.append(f"reverted by {reverted_from_branch[commit]}")
+        if commit_info.reverts_commit:
+            if commit in reverts_from_upstream:
+                extra_msgs.append(f"reverts upstream {commit_info.reverts_commit}")
+            elif commit_info.reverts_commit in reverted_from_branch:
+                extra_msgs.append(f"reverts branch {commit_info.reverts_commit}")
+            else:
+                extra_msgs.append(f"reverts unknown {commit_info.reverts_commit}")
+
         extra_msg_str = "; ".join(extra_msgs)
         if extra_msg_str:
             extra_msg_str = f"\t{extra_msg_str}"
